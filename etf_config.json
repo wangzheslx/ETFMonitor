@@ -1,0 +1,24 @@
+{
+  "etf_codes": [
+    "510050",
+    "510300",
+    "159915",
+    "588170"
+  ],
+  "data_source": "sina",
+  "refresh_interval": 5,
+  "position": {
+    "x": 1575,
+    "y": 766
+  },
+  "locked": false,
+  "opacity": 0.75,
+  "font_size": 10,
+  "up_color": "#FF4444",
+  "down_color": "#00CC00",
+  "text_color": "#E0E0E0",
+  "bg_color": "#1A1A1A",
+  "hover_tooltip_enabled": true,
+  "auto_hide": false,
+  "edge_margin": 5
+}
