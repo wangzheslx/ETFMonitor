@@ -54,6 +54,7 @@ jobs:
         run: |
           python -m PyInstaller --clean --noconfirm ETFMonitor_mac.spec
           codesign --force --deep --sign - dist/ETFMonitor.app
+          mkdir -p out
           base="${{ matrix.artifact }}"
           # 标准安装包 dmg（双击挂载，拖拽到 Applications）
           hdiutil create -volname "ETFMonitor" \
