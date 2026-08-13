@@ -1,0 +1,80 @@
+name: Release
+
+# 打个 v 开头的 tag 推上去即自动在 Windows + macOS 两个环境打包并发布 Release
+# 例如: git tag v1.0.0 && git push origin v1.0.0
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write   # 创建 Release 需要写权限
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: ETFMonitor-windows-x64.exe
+            asset_path: dist/ETFMonitor.exe
+          - os: macos-latest
+            artifact: ETFMonitor-mac.zip
+            asset_path: dist/ETFMonitor-mac.zip
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: python -m PyInstaller --clean --noconfirm ETFMonitor.spec
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          python -m PyInstaller --clean --noconfirm ETFMonitor_mac.spec
+          # Apple Silicon 上运行需要本地 adhoc 签名
+          codesign --force --deep --sign - dist/ETFMonitor.app
+          # 打成 zip 供下载
+          cd dist && ditto -c -k --keepParent ETFMonitor.app ETFMonitor-mac.zip
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.asset_path }}
+
+  release:
+    name: Publish Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name "*.exe" -o -name "*.zip" \) -exec cp {} release/ \;
+          ls -la release
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release/*
