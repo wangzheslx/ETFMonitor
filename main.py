@@ -10,6 +10,7 @@ import sys
 import os
 import json
 import time
+import re
 import requests
 from datetime import datetime
 
@@ -370,13 +371,16 @@ def _save_etf_disk_cache(lst):
 # 启动即加载磁盘缓存：首次打开对话框能秒显示（哪怕离线），后台再尝试在线更新
 _ETF_LIST_CACHE = _load_etf_disk_cache()
 
-# 东方财富 ETF 列表接口（无需 token）：fs 指定 ETF/LOF 分类，f12=代码、f14=名称
-# 注：服务端强制单页最多 100 条，需按 pn 分页循环拉取
-_ETFMARKET_LIST_URL = (
-    "http://push2.eastmoney.com/api/qt/clist/get"
-    "?po=1&np=1&fltt=2&invt=2"
-    "&fs=b:MK0021,b:MK0022,b:MK0023,b:MK0024"
-    "&fields=f12,f14&pz=100&pn={pn}"
+# 东方财富全量基金代码表（静态 JS 文件，无需 token）：
+# 内容形如 var r = [["000001","HXCZHH","华夏成长混合","混合型-灵活","HUAXIACHENGZHANGHUNHE"],...]
+# 第 0 列=代码、第 2 列=简称、第 3 列=类型；这里取名称含 "ETF" 且不含 "联接"、且代码属于场内段
+# 注：原 push2.eastmoney.com/api/qt/clist/get 在本机被服务端直接断连（反爬/IP 封锁），改用此静态文件
+_ETF_FUND_CODE_URL = "https://fund.eastmoney.com/js/fundcode_search.js"
+
+# 场内代码段前缀：沪市 5 字头 / 深市 15/16/18 字头（剔除 0 字头场外联接基金）
+_ETF_LIST_CODE_PREFIXES = (
+    "51", "52", "53", "54", "55", "56", "57", "58",  # 沪市 ETF/LOF
+    "15", "16", "18",                                  # 深市 ETF/LOF
 )
 
 
@@ -408,63 +412,62 @@ class ETFBrowseFetcher(QObject):
                     self.finished.emit()
                 return
             session = requests.Session()  # 复用连接(keep-alive)，减少握手、降低被限流概率
-            result = []
-            total = None
-            pn = 1
-            # 服务端单页最多 100 条，按 pn 循环拉取至 total
-            while True:
+            text = None
+            # 静态文件单次拉取带重试，避免偶发网络抖动导致整批丢失
+            for _ in range(4):
                 if self._stop:
                     return
-                # 单页带重试，避免服务端偶发限流（空响应/断连）导致整批丢失
-                diff = None
-                for _ in range(4):
-                    try:
-                        resp = session.get(
-                            _ETFMARKET_LIST_URL.format(pn=pn),
-                            timeout=6,
-                            headers={"User-Agent": "Mozilla/5.0",
-                                     "Referer": "https://quote.eastmoney.com/"},
-                        )
-                        page_data = (resp.json() or {}).get("data") or {}
-                        diff = page_data.get("diff") or []
-                        if total is None:
-                            total = page_data.get("total", 0) or 0
+                try:
+                    resp = session.get(
+                        _ETF_FUND_CODE_URL,
+                        timeout=10,
+                        headers={"User-Agent": "Mozilla/5.0",
+                                 "Referer": "https://fund.eastmoney.com/"},
+                    )
+                    text = resp.text
+                    # 简单校验：必须含 var r = [ 开头才算有效响应
+                    if text and "var r" in text and "[" in text:
                         break
-                    except Exception:
-                        diff = None
-                        if self._stop:
-                            return
-                        time.sleep(0.6 * (_ + 1))  # 限流后退避重试：0.6 / 1.2 / 1.8 / 2.4s
-                # 连续重试失败：放弃后续页（已收集的部分已通过增量信号显示给用户）
-                if diff is None:
-                    break
-                for item in diff:
-                    code = str(item.get("f12", "")).strip()
-                    name = str(item.get("f14", "")).strip()
-                    # 防御性过滤：代码必须是非空纯数字
-                    if code and code.isdigit() and name:
-                        result.append({"code": code, "name": name})
-                # 增量刷新：每拉到一页就把当前已收集的数据发给 UI 立即显示
+                    text = None
+                except Exception:
+                    text = None
+                    if self._stop:
+                        return
+                    time.sleep(0.6 * (_ + 1))  # 退避重试：0.6 / 1.2 / 1.8 / 2.4s
+
+            result = []
+            if text:
+                try:
+                    # 正则提取每条记录的 代码 和 简称（第 0、2 列），鲁棒性高于 JSON 解析
+                    for code, name in re.findall(
+                            r'\["(\d{6})","[^"]*","([^"]*?)","[^"]*","[^"]*"\]', text):
+                        # 过滤：名称含 ETF、不含联接（剔除场外联接基金）、代码属于场内段
+                        if ("ETF" in name and "联接" not in name
+                                and name
+                                and code.startswith(_ETF_LIST_CODE_PREFIXES)):
+                            result.append({"code": code, "name": name})
+                    # 按代码升序，保持稳定展示
+                    result.sort(key=lambda x: x["code"])
+                except Exception:
+                    result = []
+
+            if result and len(result) >= 200:
+                # 拉取相对完整：立即发给 UI + 写内存缓存 + 持久化
                 if not self._stop:
                     self.data_ready.emit(list(result))
-                # 空页、已拿够 total、或安全上限（60 页 = 6000 条）则停止
-                if not diff or (total and len(result) >= total) or pn >= 60:
-                    break
-                pn += 1
-                time.sleep(0.35)  # 页间间隔，降低被限流概率
-            # 仅当拉取相对完整（达到 total 的 90%）才写缓存，
-            # 避免限流导致的残缺数据（几百条）污染缓存、使后续刷新始终命中残缺数据
-            if result and (not total or len(result) >= int(total * 0.9)):
                 _ETF_LIST_CACHE = result
                 _ETF_LIST_CACHE_TIME = time.time()
                 _save_etf_disk_cache(result)  # 持久化，供下次离线兜底
-            elif not result or len(result) < 200:
-                # 在线几乎全失败（限流/断网）：用磁盘缓存兜底，保证查询基本可用
+            else:
+                # 在线失败或残缺：用磁盘缓存兜底，保证查询基本可用
                 disk = _load_etf_disk_cache()
                 if disk and len(disk) >= 200:
                     result = disk
                     if not self._stop:
-                        self.data_ready.emit(list(result))  # 把兜底数据发给 UI
+                        self.data_ready.emit(list(result))
+                elif not self._stop and result:
+                    # 列表残缺但非空：仍发给 UI 显示（不写缓存，避免残缺数据污染）
+                    self.data_ready.emit(list(result))
             if not self._stop:
                 self.finished.emit()
         except Exception as e:
